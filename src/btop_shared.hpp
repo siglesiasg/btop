@@ -120,6 +120,7 @@ namespace Gpu {
 	extern vector<int> shown_panels;
 	extern vector<string> gpu_names;
 	extern vector<int> gpu_b_height_offsets;
+	extern vector<int> gpu_engine_counts; //? per-engine rows of each gpu, also drawn inline in the cpu box
 	extern long long gpu_pwr_total_max;
 
 	extern std::unordered_map<string, deque<long long>> shared_gpu_percent; // averages, power/vram total
@@ -174,6 +175,10 @@ namespace Gpu {
 
 		long long encoder_utilization = 0;
 		long long decoder_utilization = 0;
+
+		//? Per-engine busy % (Intel: Render/3D, Blitter, Video, VideoEnhance, ...), drawn one row each like cpu cores
+		vector<string> engine_names = {};
+		vector<deque<long long>> engine_percent = {};
 
 		gpu_info_supported supported_functions;
 

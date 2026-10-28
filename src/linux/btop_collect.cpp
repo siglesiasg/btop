@@ -216,10 +216,13 @@ namespace Gpu {
 		nvmlReturn_t (*nvmlDeviceGetPcieThroughput)(nvmlDevice_t, nvmlPcieUtilCounter_t, unsigned int*);
 		nvmlReturn_t (*nvmlDeviceGetEncoderUtilization)(nvmlDevice_t, unsigned int*, unsigned int*);
 		nvmlReturn_t (*nvmlDeviceGetDecoderUtilization)(nvmlDevice_t, unsigned int*, unsigned int*);
+		nvmlReturn_t (*nvmlDeviceGetJpgUtilization)(nvmlDevice_t, unsigned int*, unsigned int*) = nullptr; //? optional, not in older drivers
+		nvmlReturn_t (*nvmlDeviceGetOfaUtilization)(nvmlDevice_t, unsigned int*, unsigned int*) = nullptr; //? optional, not in older drivers
 
 		//? Data
 		void* nvml_dl_handle;
 		bool initialized = false;
+		vector<array<bool, 2>> jpg_ofa_supported; //? per device, cleared in collect<1> when the call fails
 		bool init();
 		bool shutdown();
 		template <bool is_init> bool collect(gpu_info* gpus_slice);
@@ -414,10 +417,14 @@ namespace Shared {
 			using namespace Gpu;
 			count = gpus.size();
 			gpu_b_height_offsets.resize(gpus.size());
+			gpu_engine_counts.resize(gpus.size());
+			for (size_t i = 0; i < gpus.size(); ++i)
+				gpu_engine_counts[i] = (int)gpus[i].engine_percent.size();
 			for (size_t i = 0; i < gpu_b_height_offsets.size(); ++i)
 				gpu_b_height_offsets[i] = gpus[i].supported_functions.gpu_utilization
+					   + (int)gpus[i].engine_percent.size()
 					   + gpus[i].supported_functions.pwr_usage
-					   + (gpus[i].supported_functions.encoder_utilization or gpus[i].supported_functions.decoder_utilization)
+					   + ((gpus[i].supported_functions.encoder_utilization or gpus[i].supported_functions.decoder_utilization) and gpus[i].engine_percent.empty())
 					   + (gpus[i].supported_functions.mem_total or gpus[i].supported_functions.mem_used)
 						* (1 + 2*(gpus[i].supported_functions.mem_total and gpus[i].supported_functions.mem_used) + 2*gpus[i].supported_functions.mem_utilization);
 		}
@@ -1303,6 +1310,11 @@ namespace Gpu {
 
             #undef LOAD_SYM
 
+			//? Optional symbols, a missing one only hides its engine row
+			nvmlDeviceGetJpgUtilization = (decltype(nvmlDeviceGetJpgUtilization))dlsym(nvml_dl_handle, "nvmlDeviceGetJpgUtilization");
+			nvmlDeviceGetOfaUtilization = (decltype(nvmlDeviceGetOfaUtilization))dlsym(nvml_dl_handle, "nvmlDeviceGetOfaUtilization");
+			dlerror();
+
 			//? Function calls
 			nvmlReturn_t result = nvmlInit();
     		if (result != NVML_SUCCESS) {
@@ -1321,6 +1333,7 @@ namespace Gpu {
 				devices.resize(device_count);
 				gpus.resize(device_count);
 				gpu_names.resize(device_count);
+				jpg_ofa_supported.assign(device_count, {nvmlDeviceGetJpgUtilization != nullptr, nvmlDeviceGetOfaUtilization != nullptr});
 
 				initialized = true;
 
@@ -1528,6 +1541,40 @@ namespace Gpu {
 						Logger::warning("NVML: Failed to get decoder utilization: {}", nvmlErrorString(result));
 						if constexpr(is_init) gpus_slice[i].supported_functions.decoder_utilization = false;
 					} else gpus_slice[i].decoder_utilization = (long long)utilization;
+				}
+
+				//? Per-engine rows like the Intel ones: memory controller, video encode/decode, jpeg, optical flow (the GPU line is already the SM load)
+				{
+					vector<pair<string, long long>> engines;
+					if (gpus_slice[i].supported_functions.mem_utilization and not gpus_slice[i].mem_utilization_percent.empty())
+						engines.emplace_back("Mem", gpus_slice[i].mem_utilization_percent.back());
+					if (gpus_slice[i].supported_functions.encoder_utilization)
+						engines.emplace_back("Enc", gpus_slice[i].encoder_utilization);
+					if (gpus_slice[i].supported_functions.decoder_utilization)
+						engines.emplace_back("Dec", gpus_slice[i].decoder_utilization);
+					const array optional_engines = {pair{"JPG", nvmlDeviceGetJpgUtilization}, pair{"OFA", nvmlDeviceGetOfaUtilization}};
+					for (size_t n = 0; n < optional_engines.size(); ++n) {
+						if (not jpg_ofa_supported[i][n]) continue;
+						unsigned int utilization;
+						unsigned int samplingPeriodUs;
+						result = optional_engines[n].second(devices[i], &utilization, &samplingPeriodUs);
+						if (result != NVML_SUCCESS) {
+							Logger::debug("NVML: Failed to get {} utilization: {}", optional_engines[n].first, nvmlErrorString(result));
+							if constexpr(is_init) jpg_ofa_supported[i][n] = false;
+						} else engines.emplace_back(optional_engines[n].first, (long long)utilization);
+					}
+
+					//? The row set is fixed at init, the box heights are sized from it
+					if constexpr(is_init) {
+						gpus_slice[i].engine_names.clear();
+						for (const auto& [name, _] : engines) gpus_slice[i].engine_names.push_back(name);
+						gpus_slice[i].engine_percent.assign(engines.size(), deque<long long>{0});
+					}
+					for (size_t n = 0; n < engines.size() and n < gpus_slice[i].engine_percent.size(); ++n) {
+						auto& engine_data = gpus_slice[i].engine_percent[n];
+						engine_data.push_back(clamp(engines[n].second, 0ll, 100ll));
+						if (engine_data.size() > 40) engine_data.pop_front();
+					}
 				}
 
     			//? TODO: Processes using GPU
@@ -1997,6 +2044,35 @@ namespace Gpu {
 				};
 
 				gpus_slice->pwr_max_usage = 10'000; //? 10W
+
+				//? Integrated GPUs have no own sensor (i915 hwmon is discrete only): use the cpu package temperature, same die
+				if (not Cpu::cpu_sensor.empty() and Cpu::found_sensors.contains(Cpu::cpu_sensor)) {
+					gpus_slice->supported_functions.temp_info = true;
+					const auto crit = Cpu::found_sensors.at(Cpu::cpu_sensor).crit;
+					gpus_slice->temp_max = crit > 0 ? crit : 100;
+				}
+
+				//? Row labels from display names like "Render/3D/0", "Video/1": short class name, instance only if the class has several
+				gpus_slice->engine_names.clear();
+				vector<string> classes;
+				for (unsigned int i = 0; i < engines->num_engines; i++) {
+					struct engine *engine = &(&engines->engine)[i];
+					string name = engine->display_name ? engine->display_name : "Engine/0";
+					auto slash = name.rfind('/');
+					string cls = slash == string::npos ? name : name.substr(0, slash);
+					string inst = slash == string::npos ? "" : name.substr(slash + 1);
+					if (cls == "Render/3D") cls = "3D";
+					else if (cls == "VideoEnhance") cls = "VidEnh";
+					else if (cls == "Compute") cls = "Comp";
+					classes.push_back(cls);
+					gpus_slice->engine_names.push_back(cls + '\t' + inst);
+				}
+				for (auto& name : gpus_slice->engine_names) {
+					auto tab = name.find('\t');
+					string cls = name.substr(0, tab);
+					name = std::ranges::count(classes, cls) > 1 ? cls + name.substr(tab + 1) : cls;
+				}
+				gpus_slice->engine_percent.assign(engines->num_engines, deque<long long>{0});
 			}
 
 			pmu_sample(engines);
@@ -2008,6 +2084,11 @@ namespace Gpu {
 				double util = pmu_calc(&engine->busy.val, 1e9, t, 100);
 				if (util > max_util) {
 					max_util = util;
+				}
+				if (i < gpus_slice->engine_percent.size()) {
+					auto& engine_data = gpus_slice->engine_percent[i];
+					engine_data.push_back(clamp((long long)round(util), 0ll, 100ll));
+					if (engine_data.size() > 40) engine_data.pop_front();
 				}
 			}
 			gpus_slice->gpu_percent.at("gpu-totals").push_back((long long)round(max_util));
@@ -2021,6 +2102,11 @@ namespace Gpu {
 
 			double freq = pmu_calc(&engines->freq_act.val, 1, t, 1); // in MHz
 			gpus_slice->gpu_clock_speed = (unsigned int)round(freq);
+
+			if (gpus_slice->supported_functions.temp_info and Cpu::found_sensors.contains(Cpu::cpu_sensor)) {
+				gpus_slice->temp.push_back(stol(readfile(Cpu::found_sensors.at(Cpu::cpu_sensor).path, "0")) / 1000);
+				if (gpus_slice->temp.size() > 20) gpus_slice->temp.pop_front();
+			}
 
 			return true;
 		}

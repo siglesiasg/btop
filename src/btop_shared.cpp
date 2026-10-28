@@ -84,6 +84,7 @@ namespace Cpu {
 namespace Gpu {
 	vector<string> gpu_names;
 	vector<int> gpu_b_height_offsets;
+	vector<int> gpu_engine_counts;
 	std::unordered_map<string, deque<long long>> shared_gpu_percent = {
 		{"gpu-average", {}},
 		{"gpu-vram-total", {}},
